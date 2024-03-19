@@ -40,6 +40,10 @@ template<typename T, typename T2, typename T4, uint16_t TILE_SIZE_CONST, uint16_
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // TODO: multiple query sequence length for speculative decoding
     const uint tgroup_query_head_offset = tid.x * DK + tid.z * (params.N_Q_HEADS * DK);
+    
+    const int32_t SEQUENCE_LENGTH_LESS_TILE_SIZE = L - TILE_SIZE_CONST;
+    const bool LAST_TILE = (tid.y + 1) * TILE_SIZE_CONST >= L;
+    const bool LAST_TILE_ALIGNED = (SEQUENCE_LENGTH_LESS_TILE_SIZE == int32_t(tid.y * TILE_SIZE_CONST));
 
     const uint tgroup_k_head_offset = kv_head_offset_factor * DK * L;
     const uint tgroup_k_tile_offset = tid.y * TILE_SIZE_CONST * DK;
@@ -59,10 +63,6 @@ template<typename T, typename T2, typename T4, uint16_t TILE_SIZE_CONST, uint16_
     }
 
     uint KROW_ACCUM_INDEX = 0;
-
-    const int32_t SEQUENCE_LENGTH_LESS_TILE_SIZE = L - TILE_SIZE_CONST;
-    const bool LAST_TILE = (tid.y + 1) * TILE_SIZE_CONST >= L;
-    const bool LAST_TILE_ALIGNED = (SEQUENCE_LENGTH_LESS_TILE_SIZE == int32_t(tid.y * TILE_SIZE_CONST));
 
     T4 thread_data_x4;
     T4 thread_data_y4;
@@ -186,52 +186,64 @@ template<typename T, typename T2, typename T4, uint16_t TILE_SIZE_CONST, uint16_
 
     threadgroup float* smemOpartial = (threadgroup float*)(smemV + totalSmemV);
 
+    constexpr const int N_OUTPUT_VALUES = DK / NSIMDGROUPS;
+    float oPartialsLocal[N_OUTPUT_VALUES];
     if (!LAST_TILE || LAST_TILE_ALIGNED) {
-        #pragma clang loop unroll(full)
-        for(size_t col = 0; col < MATRIX_COLS; col++) {
+        constexpr const int TOTAL_MEMORY_VTILE = sizeof(T) * DK * TILE_SIZE_CONST;
+        constexpr const int TOTAL_SMEM_SIZE = 32768;
+        constexpr const int TGROUP_ITERS = (TOTAL_MEMORY_VTILE - 1) / TOTAL_SMEM_SIZE + 1 ;
+        constexpr const int TGROUP_ELEMS_PER_ITER = TOTAL_SMEM_SIZE / sizeof(T);
+        constexpr const int TGROUP_ROWS_PER_ITER = TOTAL_SMEM_SIZE / (DK * sizeof(T));
+        constexpr const int TGROUP_ROWS_PER_ITER_PER_SIMDGROUP = TGROUP_ROWS_PER_ITER / NSIMDGROUPS;
+        constexpr const int TGROUP_MATRIX_LOADS_PER_ITER = TGROUP_ROWS_PER_ITER / SIMDGROUP_MATRIX_LOAD_FACTOR;
+        static_assert(TGROUP_ROWS_PER_ITER % SIMDGROUP_MATRIX_LOAD_FACTOR == 0, "Unexpected number of rows per iteration.");
+        for(int iter = 0; iter < TGROUP_ITERS; iter++) {
+            device T* baseVThisIter = baseV + iter * TGROUP_ELEMS_PER_ITER;
+
+            // re-order to have sequential simd groups loading from gmem with scattered writes to smem.
+            // --> V is sequential across dk; load single blocks of 8 rows of dk and transpose to shared memory.x
             uint matrix_load_loop_iter = 0;
-            constexpr const size_t TILE_SIZE_CONST_DIV_8 = TILE_SIZE_CONST / 8;
-            
-            for(size_t tile_start = simd_group_id; tile_start < TILE_SIZE_CONST_DIV_8; tile_start += NSIMDGROUPS) {
-                simdgroup_matrix<T, 8, 8> tmp;
-                ulong simdgroup_matrix_offset = matrix_load_loop_iter * NSIMDGROUPS * SIMDGROUP_MATRIX_LOAD_FACTOR + simd_group_id * SIMDGROUP_MATRIX_LOAD_FACTOR;
-                ulong2 matrixOrigin = ulong2(col * SIMDGROUP_MATRIX_LOAD_FACTOR, simdgroup_matrix_offset);
-                simdgroup_load(tmp, baseV, DK, matrixOrigin, true);
-                const ulong2 matrixOriginSmem = ulong2(simdgroup_matrix_offset, 0);
-                const ulong elemsPerRowSmem = TILE_SIZE_CONST;
-                simdgroup_store(tmp, smemV, elemsPerRowSmem, matrixOriginSmem, false);
+            for(size_t tile_start = simd_group_id; tile_start < TGROUP_MATRIX_LOADS_PER_ITER; tile_start += NSIMDGROUPS) {
+                #pragma clang loop unroll(full)
+                for(size_t col = 0; col < MATRIX_COLS; col++) { // DK div 8..
+                    simdgroup_matrix<T, 8, 8> tmp;
+                    ulong simdgroup_matrix_offset = matrix_load_loop_iter * NSIMDGROUPS * SIMDGROUP_MATRIX_LOAD_FACTOR + simd_group_id * SIMDGROUP_MATRIX_LOAD_FACTOR;
+                    // columns, row.  global col coord is fine..
+                    ulong2 matrixOrigin = ulong2(col * SIMDGROUP_MATRIX_LOAD_FACTOR, simdgroup_matrix_offset);
+                    simdgroup_load(tmp, baseVThisIter, DK, matrixOrigin, false);
+                    const ulong2 matrixOriginSmem = ulong2(simdgroup_matrix_offset, col * SIMDGROUP_MATRIX_LOAD_FACTOR);
+                    const ulong elemsPerRowSmem = TILE_SIZE_CONST;
+                    simdgroup_store(tmp, smemV, elemsPerRowSmem, matrixOriginSmem, true);
+                };
                 matrix_load_loop_iter++;
-            };
-            
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            
+            }
+            threadgroup_barrier(mem_flags::mem_none);
+
             if (TILE_SIZE_CONST == 64) {
                 T2 local_p_hat = T2(pvals[0].x, pvals[0].y);
                 uint loop_iter = 0;
-                threadgroup float* oPartialSmem = smemOpartial + SIMDGROUP_MATRIX_LOAD_FACTOR * col;
-                
+
                 #pragma clang loop unroll(full)
-                for(size_t row = simd_group_id; row < SIMDGROUP_MATRIX_LOAD_FACTOR; row += NSIMDGROUPS) {
+                for(size_t row = simd_group_id; row < DK; row += NSIMDGROUPS) {
                     threadgroup T* smemV_row = smemV + (TILE_SIZE_CONST * row);
                     threadgroup T2* smemV2 = (threadgroup T2*)smemV_row;
                     T2 v_local = *(smemV2 + simd_lane_id);
-                    
+
                     T val = dot(local_p_hat, v_local);
                     simdgroup_barrier(mem_flags::mem_none);
 
                     T row_sum = simd_sum(val);
-                    oPartialSmem[simd_group_id + loop_iter * NSIMDGROUPS] = float(row_sum);
+                    oPartialsLocal[iter * TGROUP_ROWS_PER_ITER_PER_SIMDGROUP + loop_iter] = float(row_sum);
                     loop_iter++;
                 }
             }
-            
+
             if (TILE_SIZE_CONST > 64) {
-                constexpr const size_t TILE_SIZE_CONST_DIV_128 = (TILE_SIZE_CONST + 1) / 128;
-                threadgroup float* oPartialSmem = smemOpartial + SIMDGROUP_MATRIX_LOAD_FACTOR * col;
+                constexpr const size_t TILE_SIZE_CONST_DIV_128 = TILE_SIZE_CONST/ 128;
                 uint loop_iter = 0;
-                for(size_t row = simd_group_id; row < SIMDGROUP_MATRIX_LOAD_FACTOR; row += NSIMDGROUPS) {
+                for(size_t row = simd_group_id; row < DK; row += NSIMDGROUPS) {
                     threadgroup T* smemV_row = smemV + (TILE_SIZE_CONST * row);
-                    
+
                     T row_sum = 0.f;
                     for(size_t i = 0; i < TILE_SIZE_CONST_DIV_128; i++) {
                         threadgroup T4* smemV2 = (threadgroup T4*)smemV_row;
@@ -242,7 +254,7 @@ template<typename T, typename T2, typename T4, uint16_t TILE_SIZE_CONST, uint16_
                     }
                     simdgroup_barrier(mem_flags::mem_none);
                     row_sum = simd_sum(row_sum);
-                    oPartialSmem[simd_group_id + loop_iter * NSIMDGROUPS] = float(row_sum);
+                    oPartialsLocal[iter * TGROUP_ROWS_PER_ITER_PER_SIMDGROUP + loop_iter] = float(row_sum);
                     loop_iter++;
                 }
             }
@@ -329,12 +341,20 @@ template<typename T, typename T2, typename T4, uint16_t TILE_SIZE_CONST, uint16_
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if(simd_group_id == 0) {
-        threadgroup float4* oPartialVec4 = (threadgroup float4*)smemOpartial;
-        float4 vals = *(oPartialVec4 + simd_lane_id);
+    if(!LAST_TILE || LAST_TILE_ALIGNED) {
         device float* oPartialGmem = O_partials + tid.x * DK * params.KV_TILES + tid.y * DK;
-        device float4* oPartialGmemVec4 = (device float4*)oPartialGmem;
-        oPartialGmemVec4[simd_lane_id] = vals;
+        if(simd_lane_id < N_OUTPUT_VALUES) {
+            oPartialGmem[simd_lane_id * NSIMDGROUPS + simd_group_id] = oPartialsLocal[simd_lane_id];
+        }
+
+    } else {
+        if(simd_group_id == 0) {
+            threadgroup float4* oPartialVec4 = (threadgroup float4*)smemOpartial;
+            float4 vals = *(oPartialVec4 + simd_lane_id);
+            device float* oPartialGmem = O_partials + tid.x * DK * params.KV_TILES + tid.y * DK;
+            device float4* oPartialGmemVec4 = (device float4*)oPartialGmem;
+            oPartialGmemVec4[simd_lane_id] = vals;
+        }
     }
 
     if(simd_group_id == 0 && simd_lane_id == 0) {

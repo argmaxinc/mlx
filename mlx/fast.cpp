@@ -244,7 +244,7 @@ array scaled_dot_product_attention(
       query_head_dim == supported_head_dim && final_type != bfloat16 &&
       stream.device == Device::gpu;
   // TODO, update routing conditions post further tuning
-  implementation_supports_use_case &= false;
+  // implementation_supports_use_case &= false;
   if (implementation_supports_use_case) {
     auto out = array(
         out_shape,
